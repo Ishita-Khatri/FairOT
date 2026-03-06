@@ -284,10 +284,8 @@ class SubsetTrainer(Trainer):
         if self.args.auto_find_batch_size:
             if self.state.train_batch_size != self._train_batch_size:
                 from accelerate.utils import release_memory
-
                 (self.model_wrapped,) = release_memory(self.model_wrapped)
                 self.model_wrapped = self.model
-
                 # Check for DeepSpeed *after* the intial pass and modify the config
                 if self.is_deepspeed_enabled:
                     # Temporarily unset `self.args.train_batch_size`
@@ -306,8 +304,7 @@ class SubsetTrainer(Trainer):
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
-        total_train_batch_size = self._train_batch_size * \
-            args.gradient_accumulation_steps * args.world_size
+        total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps * args.world_size
 
         len_dataloader = None
         num_train_tokens = None
@@ -650,282 +647,110 @@ class SubsetTrainer(Trainer):
                         args, self.state, self.control)
                 # Collect representations until the original large batch size meets
                 if (total_batched_samples % args.gradient_accumulation_steps != 0) and (not is_last_step_and_steps_less_than_grad_acc):
-                    gA,gB = self.save_select(model, inputs)
+                    gB, gA = self.save_select(model, inputs)
                     total_reps_A.append(gA)
                     total_reps_B.append(gB)
-                    
-                #     self.control = self.callback_handler.on_substep_end(
-                #         args, self.state, self.control)
-                #     continue
-                # else:
-                #     rank = int(os.environ['RANK'])
-                #     rep = self.save_select(model, inputs)
-                #     total_reps.append(rep)
-                #     # Filter nan reps
-                #     filtered_reps = []
-                #     filtered_inputs = []
+                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                    continue
+                else:
+                    gB, gA = self.save_select(model, inputs)
+                    total_reps_A.append(gA)
+                    total_reps_B.append(gB)
 
-                #     for rep_idx, rep in enumerate(total_reps):
-                #         # Check if representations are ints (e.g. completion_length selection) or if empty
-                #         if isinstance(rep, int) or isinstance(rep, float):
-                #             if rep != 0:  # Assuming 0 length is invalid
-                #                 filtered_reps.append(rep)
-                #                 filtered_inputs.append(input_list[rep_idx])
-                #         elif rep.nelement() != 0 and not torch.isnan(rep).any() and torch.norm(rep).item() != 0:
-                #             filtered_reps.append(rep)
-                #             filtered_inputs.append(input_list[rep_idx])
+                    # Once full batch collected, on rank 0:
+                    rank = int(os.environ['RANK'])
+                        # Stack reps on this GPU
+                    stacked_B = torch.stack(total_reps_B).to(args.device)  # [N_local, m, r]
+                    stacked_A = torch.stack(total_reps_A).to(args.device)  # [N_local, r, n]
 
-                #     # filtered_reps might contain integers (e.g. completion_length selection)
-                #     if all(isinstance(rep, int) for rep in filtered_reps):
-                #         total_reps = torch.tensor(
-                #             filtered_reps, dtype=torch.long).to(args.device)
-                #     elif all(isinstance(rep, float) for rep in filtered_reps):
-                #         total_reps = torch.tensor(
-                #             filtered_reps, dtype=self.dtype).to(args.device)
-                #     else:
-                #         # If not all integers, assume they're tensors and stack them
-                #         total_reps = torch.stack(
-                #             [rep for rep in filtered_reps]).to(args.device)
-                #     dist.barrier()
+                    # Gather inputs to ALL GPUs
+                    input_to_gather = {rank: input_list}
+                    gathered_inputs = [torch.zeros_like(torch.empty(1)).to(args.device) 
+                                    for _ in range(self.args.world_size)]
+                    dist.all_gather_object(gathered_inputs, input_to_gather)
+                    complete_input_list = []
+                    for rank_idx in range(self.args.world_size):
+                        complete_input_list.extend(gathered_inputs[rank_idx][rank_idx])
 
-                #     # Gather input_list to all devices
-                #     input_to_gather = {rank: filtered_inputs}
-                #     gathered_inputs = [torch.zeros_like(torch.empty(1)).to(
-                #         args.device) for _ in range(self.args.world_size)]
-                #     dist.all_gather_object(gathered_inputs, input_to_gather)
-                #     complete_input_list = []
+                    # Gather reps to rank 0 only
+                    tensor_to_gather_B = {rank: stacked_B.cpu()}
+                    tensor_to_gather_A = {rank: stacked_A.cpu()}
+                    gathered_reps_B = [torch.zeros_like(torch.empty(1)) 
+                                    for _ in range(self.args.world_size)]
+                    gathered_reps_A = [torch.zeros_like(torch.empty(1)) 
+                                    for _ in range(self.args.world_size)]
+                    dist.gather_object(tensor_to_gather_B,object_gather_list=gathered_reps_B if rank == 0 else None, dst=0)
+                    dist.gather_object(tensor_to_gather_A,object_gather_list=gathered_reps_A if rank == 0 else None, dst=0)
 
-                #     for rank_idx in range(self.args.world_size):
-                #         complete_input_list.extend(
-                #             gathered_inputs[rank_idx][rank_idx])
+                    dist.barrier()
+                    sampling_indices = np.arange(len(complete_input_list))
+                    max_samples = int(self.new_accumulation_steps * args.world_size)
 
-                #     # Gather total_reps to rank 0
-                #     tensor_to_gather = {rank: total_reps.cpu()}
-                #     gathered_reps = [torch.zeros_like(torch.empty(
-                #         1)) for _ in range(self.args.world_size)]
-                #     dist.gather_object(
-                #         tensor_to_gather, object_gather_list=gathered_reps if rank == 0 else None, dst=0)
-                #     max_samples = int(
-                #         self.new_accumulation_steps * args.world_size)
+                    if rank == 0:
+                        # Reconstruct full rep lists from gathered tensors
+                        all_reps_B = torch.cat(
+                            [gathered_reps_B[i][i] for i in range(self.args.world_size)], dim=0)
+                        all_reps_A = torch.cat(
+                            [gathered_reps_A[i][i] for i in range(self.args.world_size)], dim=0)
+                        # all_reps_B shape: [N_total, m, r]
+                        # all_reps_A shape: [N_total, r, n]
 
-                #     if rank == 0:
-                #         all_reps = [gathered_reps[rank_idx][rank_idx]
-                #                     for rank_idx in range(self.args.world_size)]
-                #         all_reps = torch.cat(all_reps, dim=0).to(rank)
-                #         sampling_indices = np.arange(len(complete_input_list))
-                #         all_reps = all_reps[sampling_indices]
+                        # Convert to lists of matrices
+                        total_reps_B_all = [all_reps_B[i] for i in range(all_reps_B.shape[0])]
+                        total_reps_A_all = [all_reps_A[i] for i in range(all_reps_A.shape[0])]
 
-                #         # Keep all examples from specific sources
-                #         list_idx_keep = []
+                        # Compute preconditioners from current A, B
+                        AAT, BTB = self.get_preconditioners()
+                        # AAT shape: [r, r]
+                        # BTB shape: [r, r]
 
-                #         if len(self.args.keep_sources) > 0:
-                #             include_in_selection = []
+                        # Compute preconditioned gradients for all samples
+                        hB_list = []
+                        hA_list = []
+                        for gB_i, gA_i in zip(total_reps_B_all, total_reps_A_all):
+                            hB, hA = self.get_preconditioned_gradients(gB_i, gA_i, AAT, BTB)
+                            hB_list.append(hB)  # [m, r]
+                            hA_list.append(hA)  # [r, n]
 
-                #             for idx in sampling_indices:
-                #                 if complete_input_list[idx]["sources"][0] in self.args.keep_sources:
-                #                     include_in_selection.append(False)
-                #                     list_idx_keep.append(idx)
-                #                 else:
-                #                     include_in_selection.append(True)
+                        # Compute Riemannian similarity matrix
+                        sim_matrix = self.compute_riemannian_similarity_matrix(
+                            hB_list, hA_list, AAT, BTB)
+                        # shape: [N_total, N_total]
 
-                #             max_samples -= len(list_idx_keep)
-                #             # logger.info(
-                #                 # f"Exclude {len(list_idx_keep)} examples from selection. Select {max_samples} from the remaining {sum(include_in_selection)} examples.")
-                #             all_reps = all_reps[include_in_selection]
-                #             sampling_indices = sampling_indices[include_in_selection]
+                        scores = sim_matrix.mean(dim=1).cpu().numpy()        # [N_total]
+                        interaction_matrix = sim_matrix.cpu().numpy()         # [N_total, N_total]
 
-                #         all_reps_squared = torch.square(all_reps)
+                        # Greedy selection
+                        selected_idx = greats.greedy_selection(
+                            scores=scores,
+                            interaction_matrix=interaction_matrix,
+                            K=max_samples
+                        )
+                        # selected_idx is a list of ints
 
-                #         # Normalize if all_reps does not contain ints
-                #         if all_reps.dtype != torch.long:
-                #             all_reps_norm = torch.norm(
-                #                 torch.mean(all_reps, dim=0), p=2)
-                #             if args.mezo_transform == "self_normalize":
-                #                 all_reps = all_reps / \
-                #                     torch.norm(all_reps, p=2,
-                #                                dim=1, keepdim=True)
-                #             elif args.mezo_transform == "normalize":
-                #                 all_reps = all_reps / all_reps_norm
-                #             elif args.mezo_transform == "clip_full":
-                #                 clip_coef = args.max_grad_norm / all_reps_norm
-                #                 if clip_coef < 1:
-                #                     all_reps = all_reps * clip_coef
-                #             elif args.mezo_transform == "clip_last":
-                #                 # Approximate by dividing by the number of layers
-                #                 clip_coef = args.max_grad_norm / \
-                #                     (all_reps_norm / 32)
-                #                 if clip_coef < 1:
-                #                     all_reps = all_reps * clip_coef
-                #         else:
-                #             all_reps_norm = None
-
-                #         # Transform all_reps to adam updates if necessary
-                #         if self.args.mezo_optim == "adam":
-                #             # If we are using backprop gradients, get the previous m_t and v_t from the optimizer directly
-                #             if 'grad' in self.args.data_selection_unit:
-                #                 if 'exp_avg' in self.optimizer.state[self.named_parameters_to_optim[0][1]]:
-                #                     prev_m_t = torch.cat(
-                #                         [self.optimizer.state[param]['exp_avg'].flatten()
-                #                          for _, param in self.named_parameters_to_optim]
-                #                     )
-                #                     prev_v_t = torch.cat(
-                #                         [self.optimizer.state[param]['exp_avg_sq'].flatten()
-                #                          for _, param in self.named_parameters_to_optim]
-                #                     )
-                #                 else:
-                #                     prev_m_t = torch.zeros_like(all_reps[0])
-                #                     prev_v_t = torch.zeros_like(
-                #                         all_reps_squared[0])
-                #             else:
-                #                 # If first step, set m_{t-1} and v_{t-1} to zeros with shape of last layer grads
-                #                 if self.prev_m_t is None or self.prev_v_t is None:
-                #                     self.prev_m_t = torch.zeros_like(
-                #                         all_reps[1])
-                #                     self.prev_v_t = torch.zeros_like(
-                #                         all_reps_squared[1])
-                #                 prev_m_t = self.prev_m_t
-                #                 prev_v_t = self.prev_v_t
-
-                #             # Compute update
-                #             m_t = self.args.adam_beta1 * prev_m_t + \
-                #                 (1-self.args.adam_beta1) * all_reps
-                #             v_t = self.args.adam_beta2 * prev_v_t + \
-                #                 (1-self.args.adam_beta2) * all_reps_squared
-                #             m_hat = m_t / (1 - self.args.adam_beta1 **
-                #                            (self.state.global_step+1))
-                #             v_hat = v_t / (1 - self.args.adam_beta2 **
-                #                            (self.state.global_step+1))
-                #             adam_updates = m_hat / \
-                #                 (torch.sqrt(v_hat) + self.args.adam_epsilon)
-                #             all_reps = adam_updates
-
-                #         # Select masking
-                #         if self.args.source_wise_selection != "none":
-                #             source_list = []
-                #             for idx in sampling_indices:
-                #                 source = complete_input_list[idx]["sources"][0]
-                #                 # Check if it's a tensor and get its item, otherwise leave it as it is
-                #                 if isinstance(source, torch.Tensor):
-                #                     source = source.item()
-                #                 source_list.append(source)
-                #             # logger.info(f"{sorted(Counter(source_list).items())}")
-                #         else:
-                #             source_list = None
-
-                #         if self.args.data_selection_unit in ["completion_length", "length_loss_weighted"]:
-                #             all_reps = all_reps
-                #         else:
-                #             if self.args.mezo_topk == "random":
-                #                 ranked_indices = torch.randperm(len(all_reps[0]))[
-                #                     :self.args.zo_dim]
-                #                 all_reps = all_reps[:, ranked_indices]
-                #             else:
-                #                 all_reps = self.select_masking(
-                #                     all_reps, source_list)
-                # Once full batch collected, on rank 0:
-                rank = int(os.environ['RANK'])
-                if rank == 0:
-                    AAT, BTB = self.get_preconditioners()
-                    hB_list = []
-                    hA_list = []
-                    for gB, gA in zip(total_reps_B, total_reps_A):
-                        hB, hA = self.get_preconditioned_gradients(gB, gA, AAT, BTB)
-                        hB_list.append(hB)   # [m, r]
-                        hA_list.append(hA)   # [r, n]
-
-                    # Compute Riemannian similarity matrix
-                    sim_matrix = self.compute_riemannian_similarity_matrix(
-                        hB_list, hA_list, AAT, BTB
-                    )
-                    
-                    scores = sim_matrix.mean(dim=1).cpu().numpy()   # [N]
-                    interaction_matrix = sim_matrix.cpu().numpy()    # [N, N]
-
-                    # Feed into greedy selection
-                    selected_idx = greats.greedy_selection(
-                        scores=scores,
-                        interaction_matrix=interaction_matrix,
-                        K=8
-                    )
-                    idx = torch.tensor(selected_idx)
-                    len = selected_idx.shape[0]
-                    selected_weights = torch.ones_like(idx)
-
-                        # if max_samples > 0:
-                        #     selected_idx, selected_weights = self.select_data(
-                        #         all_reps,
-                        #         max_samples=max_samples,
-                        #         source_list=source_list,
-                        #         model=model
-                        #     )
-
-                        #     # Update Adam historical terms with mean of selected subset's last layer gradients for MeZO only
-                        #     # Otherwise, we can get prev_m_t and prev_v_t from the optimizer directly
-                        #     if self.args.mezo_optim == "adam" and "grad" not in self.args.data_selection_unit:
-                        #         self.prev_m_t = m_t[selected_idx].mean(
-                        #             dim=0).detach()
-                        #         self.prev_v_t = v_t[selected_idx].mean(
-                        #             dim=0).detach()
-
-                        #     # Map selected indices back to original indices
-                        #     # Question: Do we need to shuffle selected_idx?
-                        #     # Does the order of examples in each device matter?
-                        #     selected_weights = torch.tensor(
-                        #         [1 for _ in range(len(list_idx_keep))] + selected_weights.tolist())
-                        #     selected_idx = list_idx_keep + \
-                        #         sampling_indices[selected_idx].tolist()
-                        # # TODO: Improve this part
-                        # # If max_samples <= 0, keep the first max_samples
-                        # elif max_samples == 0:
-                        #     selected_idx = list_idx_keep
-                        #     selected_weights = torch.ones(
-                        #         len(selected_idx), dtype=torch.float32)
-                        # else:
-                        #     selected_idx = list_idx_keep[:max_samples]
-                        #     selected_weights = torch.ones(
-                        #         len(selected_idx), dtype=torch.float32)
-
-                        # Save indices
+                        # Save indices if needed
                         if self.args.save_indices:
-                            # Full indices
                             current_step = outer_step + epoch * steps_in_epoch
                             self.extract_and_save_original_indices(
                                 complete_input_list,
                                 range(len(complete_input_list)),
-                                os.path.join(
-                                    self.indices_path, f'iter{current_step}_full_indices.pt')
-                            )
-                            # Sampling indices
+                                os.path.join(self.indices_path, f'iter{current_step}_full_indices.pt'))
                             self.extract_and_save_original_indices(
                                 complete_input_list,
                                 sampling_indices,
-                                os.path.join(
-                                    self.indices_path, f'iter{current_step}_sampling_indices.pt')
-                            )
-                            # Selected indices
+                                os.path.join(self.indices_path, f'iter{current_step}_sampling_indices.pt'))
                             self.extract_and_save_original_indices(
                                 complete_input_list,
                                 selected_idx,
-                                os.path.join(
-                                    self.indices_path, f'iter{current_step}_selected_indices.pt')
-                            )
+                                os.path.join(self.indices_path, f'iter{current_step}_selected_indices.pt'))
 
-                        if "weighted" in args.data_selection_method:
-                            inputs_weights = (
-                                selected_weights * args.small_batch_ratio).to(torch.float32)
-                        else:
-                            inputs_weights = torch.ones(
-                                len(selected_idx), dtype=torch.float32)
-                        # Explicitly convert selected_idx to int32 to avoid
-                        # undesirable behavior after broadcasting
-                        selected_idx_tensor = torch.tensor(
-                            selected_idx).to(torch.int32).to(rank)
-                        selected_weights_tensor = inputs_weights.to(rank)
+                        # Build tensors to broadcast
+                        selected_idx_tensor = torch.tensor(selected_idx).to(torch.int32).to(rank)
+                        selected_weights_tensor = torch.ones(
+                            len(selected_idx), dtype=torch.float32).to(rank)
                     else:
-                        selected_idx_tensor = torch.zeros(
-                            max_samples, dtype=torch.int32).to(rank)
-                        selected_weights_tensor = torch.zeros(
-                            max_samples, dtype=torch.float32).to(rank)
+                        selected_idx_tensor = torch.zeros(max_samples, dtype=torch.int32).to(rank)
+                        selected_weights_tensor = torch.zeros(max_samples, dtype=torch.float32).to(rank)
 
                     # Broadcast
                     dist.broadcast(selected_idx_tensor, src=0)
@@ -934,12 +759,15 @@ class SubsetTrainer(Trainer):
                     selected_weights = selected_weights_tensor.to(self.dtype)
                     # Shuffle selected samples
                     train_on_each = self.new_accumulation_steps
-                    selected_inputs = [complete_input_list[i]
-                                       for i in selected_idx[train_on_each*rank:train_on_each*(rank+1)]]
-                    selected_weights = selected_weights[train_on_each *
-                                                        rank:train_on_each*(rank+1)]
-                    # Reinit
-                    total_reps = []
+                    selected_inputs = [
+                        complete_input_list[i]
+                        for i in selected_idx[train_on_each * rank: train_on_each * (rank + 1)]
+                    ]
+                    selected_weights = selected_weights[train_on_each * rank: train_on_each * (rank + 1)]
+
+                    # Reset for next large batch
+                    total_reps_A = []
+                    total_reps_B = []
                     input_list = []
 
                     for inner_step, inner_inputs in enumerate(selected_inputs):
@@ -955,7 +783,7 @@ class SubsetTrainer(Trainer):
                             # if loss is nan or inf simply add the average of previous logged losses
                             tr_loss += tr_loss / \
                                 (1 + self.state.global_step -
-                                 self._globalstep_last_logged)
+                                    self._globalstep_last_logged)
                         else:
                             if tr_loss.device != tr_loss_step.device:
                                 raise ValueError(
